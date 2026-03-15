@@ -25,7 +25,8 @@ if Code.ensure_loaded?(Plug) do
         - `:on_close` - Function to call when connection closes
 
     ## Messages handled
-      - `{:sse_message, binary}` - Message to send to client
+      - `{:sse_message, binary}` - Message to send to client (fire-and-forget)
+      - `{:sse_message_ack, binary, pid, reference}` - Message with delivery confirmation
       - `:close_sse` - Close the connection gracefully
     """
     @spec start(conn, transport, session_id, keyword()) :: conn
@@ -89,6 +90,24 @@ if Code.ensure_loaded?(Plug) do
               conn
           end
 
+        {:sse_message_ack, message, reply_to, ref} when is_binary(message) ->
+          case send_event(conn, message, event_counter) do
+            {:ok, conn} ->
+              send(reply_to, {:sse_ack, ref})
+              loop(conn, transport, session_id, event_counter + 1)
+
+            {:error, reason} ->
+              send(reply_to, {:sse_nack, ref, reason})
+
+              Logging.transport_event(
+                "sse_send_failed",
+                %{session_id: session_id, reason: reason},
+                level: if(reason == :closed, do: :warning, else: :error)
+              )
+
+              conn
+          end
+
         {:sse_message, message} when is_binary(message) ->
           case send_event(conn, message, event_counter) do
             {:ok, conn} ->
@@ -97,11 +116,8 @@ if Code.ensure_loaded?(Plug) do
             {:error, reason} ->
               Logging.transport_event(
                 "sse_send_failed",
-                %{
-                  session_id: session_id,
-                  reason: reason
-                },
-                level: :error
+                %{session_id: session_id, reason: reason},
+                level: if(reason == :closed, do: :warning, else: :error)
               )
 
               conn
