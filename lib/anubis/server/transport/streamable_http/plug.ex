@@ -263,16 +263,42 @@ if Code.ensure_loaded?(Plug) do
         )
     end
 
+    @sse_ack_timeout 1_000
+
     defp route_sse_response(conn, response, session_id, %{transport: transport} = opts) do
       handler_pid = StreamableHTTP.get_sse_handler(transport, session_id)
 
       cond do
         handler_pid && Process.alive?(handler_pid) ->
-          send(handler_pid, {:sse_message, response})
+          ref = make_ref()
+          send(handler_pid, {:sse_message_ack, response, self(), ref})
 
-          conn
-          |> put_resp_content_type("application/json")
-          |> send_resp(202, "{}")
+          receive do
+            {:sse_ack, ^ref} ->
+              conn
+              |> put_resp_content_type("application/json")
+              |> send_resp(202, "{}")
+
+            {:sse_nack, ^ref, reason} ->
+              Logging.transport_event(
+                "sse_delivery_failed",
+                %{session_id: session_id, reason: reason},
+                level: :warning
+              )
+
+              StreamableHTTP.unregister_sse_handler(transport, session_id, handler_pid)
+              establish_sse_for_request(conn, response, session_id, opts)
+          after
+            @sse_ack_timeout ->
+              Logging.transport_event(
+                "sse_delivery_timeout",
+                %{session_id: session_id},
+                level: :warning
+              )
+
+              StreamableHTTP.unregister_sse_handler(transport, session_id, handler_pid)
+              establish_sse_for_request(conn, response, session_id, opts)
+          end
 
         handler_pid ->
           StreamableHTTP.unregister_sse_handler(transport, session_id, handler_pid)
