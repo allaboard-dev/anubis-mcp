@@ -66,7 +66,8 @@ defmodule Anubis.Server.Session do
     {:registry, {:atom, {:default, Anubis.Server.Registry}}},
     {:session_idle_timeout, {{:integer, {:gte, 1}}, {:default, @default_session_idle_timeout}}},
     {:timeout, {:integer, {:default, to_timeout(second: 30)}}},
-    {:task_supervisor, {:required, {:custom, &Anubis.genserver_name/1}}}
+    {:task_supervisor, {:required, {:custom, &Anubis.genserver_name/1}}},
+    {:restored_state, {:map, {:default, nil}}}
   ])
 
   @doc """
@@ -94,6 +95,66 @@ defmodule Anubis.Server.Session do
   # Lifecycle
 
   @impl GenServer
+  def init(%{restored_state: restored} = opts) when is_map(restored) do
+    module = opts.server_module
+    server_info = module.server_info()
+    capabilities = module.server_capabilities()
+    protocol_versions = module.supported_protocol_versions()
+
+    protocol_version = get_restored(restored, :protocol_version)
+
+    protocol_module =
+      case Anubis.Protocol.Registry.get(protocol_version) do
+        {:ok, mod} -> mod
+        :error -> nil
+      end
+
+    state = %{
+      session_id: opts.session_id,
+      server_module: module,
+      protocol_version: protocol_version,
+      protocol_module: protocol_module,
+      initialized: get_restored(restored, :initialized) || false,
+      client_info: get_restored(restored, :client_info),
+      client_capabilities: get_restored(restored, :client_capabilities),
+      log_level: get_restored(restored, :log_level),
+      frame: Frame.from_saved(get_restored(restored, :frame) || %{}),
+      server_info: server_info,
+      capabilities: capabilities,
+      supported_versions: protocol_versions,
+      transport: Map.new(opts.transport),
+      registry: opts.registry,
+      session_idle_timeout: opts.session_idle_timeout,
+      expiry_timer: nil,
+      pending_requests: %{},
+      server_requests: %{},
+      timeout: opts.timeout,
+      task_supervisor: opts.task_supervisor
+    }
+
+    state = schedule_session_expiry(state)
+
+    Logging.server_event("session_restored", %{
+      session_id: opts.session_id,
+      module: module,
+      protocol_version: protocol_version,
+      initialized: state.initialized
+    })
+
+    Telemetry.execute(
+      Telemetry.event_server_init(),
+      %{system_time: System.system_time()},
+      %{
+        module: module,
+        server_info: server_info,
+        capabilities: capabilities,
+        session_id: opts.session_id
+      }
+    )
+
+    {:ok, state, :hibernate}
+  end
+
   def init(opts) do
     module = opts.server_module
     server_info = module.server_info()
@@ -968,5 +1029,15 @@ defmodule Anubis.Server.Session do
     Enum.map(requests, fn {id, req} ->
       %{id: id, method: req[:method]}
     end)
+  end
+
+  # Indifferent key access for restored session state.
+  # Redis store returns string keys (via JSON decode), but in-memory
+  # stores may use atom keys. This handles both cases.
+  defp get_restored(map, key) when is_atom(key) do
+    case Map.get(map, Atom.to_string(key)) do
+      nil -> Map.get(map, key)
+      value -> value
+    end
   end
 end
