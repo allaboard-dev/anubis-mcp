@@ -160,7 +160,7 @@ if Code.ensure_loaded?(Plug) do
     end
 
     defp handle_notification_message(conn, message, session_id, context, opts) do
-      case find_session(opts, session_id) do
+      case find_or_restore_session(opts, session_id) do
         {:ok, session_pid} ->
           GenServer.cast(session_pid, {:mcp_notification, message, context})
 
@@ -168,13 +168,13 @@ if Code.ensure_loaded?(Plug) do
           |> put_resp_content_type("application/json")
           |> send_resp(202, "{}")
 
-        {:error, :not_found} ->
+        {:error, :no_session} ->
           send_error(conn, 400, "No active session")
       end
     end
 
     defp handle_response_message(conn, message, session_id, context, opts) do
-      case find_session(opts, session_id) do
+      case find_or_restore_session(opts, session_id) do
         {:ok, session_pid} ->
           GenServer.cast(session_pid, {:mcp_response, message, context})
 
@@ -182,7 +182,7 @@ if Code.ensure_loaded?(Plug) do
           |> put_resp_content_type("application/json")
           |> send_resp(202, "{}")
 
-        {:error, :not_found} ->
+        {:error, :no_session} ->
           send_error(conn, 400, "No active session")
       end
     end
@@ -360,6 +360,13 @@ if Code.ensure_loaded?(Plug) do
       mod.lookup_session(name, session_id)
     end
 
+    defp find_or_restore_session(opts, session_id) do
+      case find_session(opts, session_id) do
+        {:ok, pid} -> {:ok, pid}
+        {:error, :not_found} -> maybe_restore_session(opts, session_id)
+      end
+    end
+
     defp find_or_create_session(opts, session_id, message) do
       case find_session(opts, session_id) do
         {:ok, pid} ->
@@ -369,7 +376,7 @@ if Code.ensure_loaded?(Plug) do
           start_new_session(opts, session_id)
 
         {:error, :not_found} ->
-          {:error, :no_session}
+          maybe_restore_session(opts, session_id)
       end
     end
 
@@ -397,6 +404,61 @@ if Code.ensure_loaded?(Plug) do
 
         {:error, reason} ->
           {:error, reason}
+      end
+    end
+
+    defp maybe_restore_session(opts, session_id) do
+      case Anubis.get_session_store_adapter() do
+        nil ->
+          {:error, :no_session}
+
+        store ->
+          case store.load(session_id, []) do
+            {:ok, saved_state} ->
+              restore_session(opts, session_id, saved_state)
+
+            {:error, _reason} ->
+              {:error, :no_session}
+          end
+      end
+    end
+
+    defp restore_session(
+           %{server: server, registry_mod: registry_mod, registry_name: registry_name} = opts,
+           session_id,
+           saved_state
+         ) do
+      session_config = ServerSupervisor.get_session_config(server)
+      session_name = Registry.session_name(server, session_id)
+
+      session_opts = [
+        session_id: session_id,
+        server_module: server,
+        name: session_name,
+        transport: session_config.transport,
+        session_idle_timeout: session_config.session_idle_timeout || 1_800_000,
+        timeout: opts.timeout,
+        task_supervisor: session_config.task_supervisor,
+        restored_state: saved_state
+      ]
+
+      Logging.transport_event("restoring_session", %{session_id: session_id})
+
+      case ServerSupervisor.start_session(server, session_opts) do
+        {:ok, pid} ->
+          registry_mod.register_session(registry_name, session_id, pid)
+          {:ok, pid}
+
+        {:error, {:already_started, pid}} ->
+          {:ok, pid}
+
+        {:error, reason} ->
+          Logging.transport_event("session_restore_failed", %{
+            session_id: session_id,
+            reason: reason
+          })
+
+          {:error, :no_session}
       end
     end
 
