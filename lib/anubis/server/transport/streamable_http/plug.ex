@@ -298,6 +298,7 @@ if Code.ensure_loaded?(Plug) do
 
       case Streaming.send_event(conn, response, 0) do
         {:ok, conn} ->
+          {:ok, conn} = Plug.Conn.chunk(conn, "")
           conn
 
         {:error, reason} ->
