@@ -10,6 +10,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
   alias Anubis.Server.Supervisor, as: ServerSupervisor
   alias Anubis.Server.Transport.StreamableHTTP
   alias Anubis.Server.Transport.StreamableHTTP.Plug, as: StreamableHTTPPlug
+  alias Anubis.Test.MockSessionStore
 
   @moduletag capture_log: true
 
@@ -525,6 +526,84 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
       assert conn.status == 200
       {:ok, response} = Jason.decode(conn.resp_body)
       assert response["result"]["protocolVersion"]
+    end
+
+    test "reconnect: initialize on expired session with stored state succeeds and subsequent requests work",
+         %{opts: opts} do
+      # Simulate a session that existed before a server restart: persisted data is
+      # present in the store but no live session process is running.
+      session_id = "reconnect-session-#{System.unique_integer([:positive])}"
+
+      {:ok, _} = MockSessionStore.start_link([])
+      MockSessionStore.reset!()
+
+      original_config = Application.get_env(:anubis_mcp, :session_store)
+
+      Application.put_env(:anubis_mcp, :session_store,
+        enabled: true,
+        adapter: MockSessionStore,
+        ttl: 1_800_000
+      )
+
+      on_exit(fn ->
+        if original_config do
+          Application.put_env(:anubis_mcp, :session_store, original_config)
+        else
+          Application.delete_env(:anubis_mcp, :session_store)
+        end
+      end)
+
+      :ok =
+        MockSessionStore.save(
+          session_id,
+          %{
+            "id" => session_id,
+            "protocol_version" => "2025-03-26",
+            "initialized" => true,
+            "client_info" => %{"name" => "Claude Desktop", "version" => "1.0"}
+          },
+          []
+        )
+
+      # Step 1: client re-sends initialize with the old session ID (reconnect).
+      init_request =
+        build_request("initialize", %{
+          "protocolVersion" => "2025-03-26",
+          "clientInfo" => %{"name" => "Claude Desktop", "version" => "1.0"},
+          "capabilities" => %{}
+        })
+
+      {:ok, init_body} = Message.encode_request(init_request, "reconnect_init")
+
+      init_conn =
+        :post
+        |> conn("/", init_body)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json")
+        |> put_req_header("mcp-session-id", session_id)
+        |> StreamableHTTPPlug.call(opts)
+
+      assert init_conn.status == 200
+      {:ok, init_response} = Jason.decode(init_conn.resp_body)
+      assert init_response["result"]["protocolVersion"]
+
+      # Step 2: client sends a tool request WITHOUT first sending
+      # notifications/initialized — this must not fail with "Server not initialized".
+      tools_request = build_request("tools/list", %{})
+      {:ok, tools_body} = Message.encode_request(tools_request, "reconnect_tools")
+
+      tools_conn =
+        :post
+        |> conn("/", tools_body)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json")
+        |> put_req_header("mcp-session-id", session_id)
+        |> StreamableHTTPPlug.call(opts)
+
+      assert tools_conn.status == 200
+      {:ok, tools_response} = Jason.decode(tools_conn.resp_body)
+      assert Map.has_key?(tools_response["result"], "tools"),
+             "Expected tools list but got: #{inspect(tools_response)}"
     end
   end
 end

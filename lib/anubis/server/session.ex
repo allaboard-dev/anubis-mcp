@@ -894,6 +894,7 @@ defmodule Anubis.Server.Session do
        ) do
     Logging.server_event("client_initialized", %{session_id: state.session_id})
 
+    already_initialized = state.initialized
     state = %{state | initialized: true}
 
     maybe_persist_session(state)
@@ -905,8 +906,10 @@ defmodule Anubis.Server.Session do
 
     frame = prepare_frame(state)
 
+    # Skip module.init/2 if the session was already initialized via auto_initialize
+    # (reconnect path) to prevent a double-init call.
     {:ok, frame} =
-      if Anubis.exported?(module, :init, 2),
+      if not already_initialized and Anubis.exported?(module, :init, 2),
         do: module.init(state.client_info, frame),
         else: {:ok, frame}
 

@@ -340,10 +340,26 @@ if Code.ensure_loaded?(Plug) do
           {:ok, pid}
 
         {:error, :not_found} when Message.is_initialize(message) ->
-          start_new_session(opts, session_id)
+          # When a client re-sends `initialize` with a known session ID (e.g. after
+          # server restart), we check the session store. If persisted state exists,
+          # this is a reconnect: auto-initialize so subsequent requests succeed even
+          # if `notifications/initialized` never arrives. If there is no stored state,
+          # this is a genuine first connection and the normal handshake path applies.
+          if session_stored?(session_id) do
+            start_and_auto_initialize_session(opts, session_id)
+          else
+            start_new_session(opts, session_id)
+          end
 
         {:error, :not_found} ->
           start_and_auto_initialize_session(opts, session_id)
+      end
+    end
+
+    defp session_stored?(session_id) do
+      case Anubis.get_session_store_adapter() do
+        nil -> false
+        store -> match?({:ok, _}, store.load(session_id, []))
       end
     end
 
