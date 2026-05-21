@@ -10,6 +10,29 @@ defmodule Anubis.Server.SessionTest do
 
   @moduletag capture_log: true
 
+  defmodule InitTrackingServer do
+    @moduledoc false
+    use Anubis.Server,
+      name: "Init Tracking",
+      version: "1.0.0",
+      capabilities: [:tools]
+
+    @impl true
+    def init(client_info, frame) do
+      case :persistent_term.get({__MODULE__, :test_pid}, nil) do
+        nil -> :ok
+        pid -> send(pid, {:init_called, client_info})
+      end
+
+      {:ok, frame}
+    end
+
+    @impl true
+    def handle_request(_request, frame) do
+      {:reply, %{"tools" => []}, frame}
+    end
+  end
+
   describe "start_link/1" do
     test "starts a session with valid options" do
       transport_name = Registry.transport_name(StubServer, StubTransport)
@@ -81,6 +104,88 @@ defmodule Anubis.Server.SessionTest do
 
       request = build_request("ping", 123)
       assert {:ok, _} = GenServer.call(session, {:mcp_request, request, %{}})
+    end
+  end
+
+  describe "request between initialize and notifications/initialized" do
+    test "tools/list is served immediately after initialize without waiting for the notification" do
+      transport_name = Registry.transport_name(StubServer, StubTransport)
+      start_supervised!({StubTransport, name: transport_name})
+      task_sup = Registry.task_supervisor_name(StubServer)
+      start_supervised!({Task.Supervisor, name: task_sup})
+
+      session_id = "race-session-#{System.unique_integer([:positive])}"
+      session_name = Registry.session_name(StubServer, session_id)
+
+      session =
+        start_supervised!(
+          {Session,
+           session_id: session_id,
+           server_module: StubServer,
+           name: session_name,
+           transport: [layer: StubTransport, name: transport_name],
+           task_supervisor: task_sup},
+          id: :race_session
+        )
+
+      init_request =
+        Anubis.MCP.Builders.init_request(
+          "2025-03-26",
+          %{"name" => "TestClient", "version" => "1.0.0"}
+        )
+
+      assert {:ok, _} = GenServer.call(session, {:mcp_request, init_request, %{}})
+
+      # No notifications/initialized has been received yet. The session must
+      # still serve a follow-up request — this is the race the not-initialized
+      # rejection used to lose on Streamable HTTP.
+      tools_request = build_request("tools/list", %{}, "tools-1")
+
+      assert {:ok, response} =
+               GenServer.call(session, {:mcp_request, tools_request, %{}})
+
+      decoded = Jason.decode!(response)
+      assert decoded["id"] == "tools-1"
+      assert Map.has_key?(decoded, "result"), "expected success, got: #{inspect(decoded)}"
+      assert decoded["result"]["tools"]
+    end
+
+    test "module.init/2 fires exactly once across initialize + notifications/initialized" do
+      :persistent_term.put({InitTrackingServer, :test_pid}, self())
+      on_exit(fn -> :persistent_term.erase({InitTrackingServer, :test_pid}) end)
+
+      transport_name = Registry.transport_name(InitTrackingServer, StubTransport)
+      start_supervised!({StubTransport, name: transport_name})
+      task_sup = Registry.task_supervisor_name(InitTrackingServer)
+      start_supervised!({Task.Supervisor, name: task_sup})
+
+      session_id = "init-once-#{System.unique_integer([:positive])}"
+      session_name = Registry.session_name(InitTrackingServer, session_id)
+
+      session =
+        start_supervised!(
+          {Session,
+           session_id: session_id,
+           server_module: InitTrackingServer,
+           name: session_name,
+           transport: [layer: StubTransport, name: transport_name],
+           task_supervisor: task_sup},
+          id: :init_once_session
+        )
+
+      init_request =
+        Anubis.MCP.Builders.init_request(
+          "2025-03-26",
+          %{"name" => "TestClient", "version" => "1.0.0"}
+        )
+
+      assert {:ok, _} = GenServer.call(session, {:mcp_request, init_request, %{}})
+      assert_receive {:init_called, %{"name" => "TestClient"}}, 500
+
+      notification = build_notification("notifications/initialized", %{})
+      assert :ok = GenServer.cast(session, {:mcp_notification, notification, %{}})
+
+      refute_receive {:init_called, _}, 100
     end
   end
 

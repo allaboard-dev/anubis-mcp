@@ -600,9 +600,17 @@ defmodule Anubis.Server.Session do
 
   # Request handling
 
+  # A session is serviceable once `initialize` has completed (protocol_version
+  # set), even if `notifications/initialized` has not yet been processed.
+  # Streamable HTTP clients routinely send the notification (a cast) and the
+  # next request (a call) back-to-back over separate HTTP connections, and the
+  # scheduler may deliver the call first. Without this relaxation, the call
+  # would be rejected with "Server not initialized" and the client would time
+  # out 30s later because the error response was discarded.
   defguardp is_server_initialized(decoded, state)
             when Message.is_initialize_lifecycle(decoded) or
-                   state.initialized == true
+                   state.initialized == true or
+                   state.protocol_version != nil
 
   defp handle_single_request(decoded, transport_context, from, state) do
     cond do
@@ -663,7 +671,7 @@ defmodule Anubis.Server.Session do
 
   # Initialize handling
 
-  defp handle_request(%{"params" => params} = request, _transport_context, _from, state)
+  defp handle_request(%{"params" => params} = request, _transport_context, _from, %{server_module: module} = state)
        when Message.is_initialize(request) do
     %{
       "clientInfo" => client_info,
@@ -674,6 +682,10 @@ defmodule Anubis.Server.Session do
     {:ok, protocol_version, protocol_module} =
       Anubis.Protocol.Registry.negotiate(requested_version, state.supported_versions)
 
+    # If the session was already initialized via auto_initialize (reconnect
+    # path), skip module.init/2 to avoid invoking the user callback twice.
+    already_initialized = state.initialized
+
     state = %{
       state
       | protocol_version: protocol_version,
@@ -681,6 +693,19 @@ defmodule Anubis.Server.Session do
         client_info: client_info,
         client_capabilities: client_capabilities
     }
+
+    # Invoke module.init/2 now rather than waiting for notifications/initialized.
+    # The notification is fire-and-forget from the client's perspective and may
+    # arrive after subsequent requests due to HTTP scheduling. Firing init/2
+    # here guarantees user state is ready before any tool/resource call runs.
+    frame = prepare_frame(state)
+
+    {:ok, frame} =
+      if not already_initialized and Anubis.exported?(module, :init, 2),
+        do: module.init(client_info, frame),
+        else: {:ok, frame}
+
+    state = %{state | frame: frame}
 
     maybe_persist_session(state)
 
@@ -898,11 +923,10 @@ defmodule Anubis.Server.Session do
   defp handle_notification(
          %{"method" => "notifications/initialized"},
          _transport_context,
-         %{server_module: module} = state
+         state
        ) do
     Logging.server_event("client_initialized", %{session_id: state.session_id})
 
-    already_initialized = state.initialized
     state = %{state | initialized: true}
 
     maybe_persist_session(state)
@@ -912,16 +936,12 @@ defmodule Anubis.Server.Session do
       initialized: true
     })
 
-    frame = prepare_frame(state)
-
-    # Skip module.init/2 if the session was already initialized via auto_initialize
-    # (reconnect path) to prevent a double-init call.
-    {:ok, frame} =
-      if not already_initialized and Anubis.exported?(module, :init, 2),
-        do: module.init(state.client_info, frame),
-        else: {:ok, frame}
-
-    {:noreply, %{state | frame: frame}}
+    # module.init/2 was invoked at the end of `handle_request(initialize)` —
+    # see the `is_initialize(request)` clause below. This notification only
+    # marks the session as fully handshaked; clients sometimes never send
+    # it (or send it after the first real request), so init/2 cannot wait
+    # for this signal.
+    {:noreply, state}
   end
 
   defp handle_notification(%{"method" => "notifications/cancelled"} = notification, _transport_context, state) do
