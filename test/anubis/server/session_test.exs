@@ -35,7 +35,7 @@ defmodule Anubis.Server.SessionTest do
   describe "handle_call/3 for messages" do
     setup :initialized_server
 
-    test "rejects requests when not initialized" do
+    test "rejects requests when not initialized and preserves the request id" do
       transport_name = Registry.transport_name(StubServer, StubTransport)
       task_sup = Registry.task_supervisor_name(StubServer)
       session_name = Registry.session_name(StubServer, "not_initialized")
@@ -51,14 +51,15 @@ defmodule Anubis.Server.SessionTest do
           id: :uninit_session
         )
 
-      request = build_request("tools/list", %{}, 123)
+      request_id = "req-not-init-#{System.unique_integer([:positive])}"
+      request = build_request("tools/list", %{}, request_id)
 
-      assert {:ok, encoded} =
+      assert {:ok, response} =
                GenServer.call(session, {:mcp_request, request, %{}})
 
-      assert {:ok, [decoded]} = Message.decode(encoded)
+      decoded = Jason.decode!(response)
       # error must echo the request id, else the client can't correlate the reply
-      assert decoded["id"] == 123
+      assert decoded["id"] == request_id
       assert decoded["error"]["data"]["message"] == "Server not initialized"
     end
 

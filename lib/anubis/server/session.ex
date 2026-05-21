@@ -637,11 +637,19 @@ defmodule Anubis.Server.Session do
 
     Logging.server_event(
       "request_error",
-      %{error: error, reason: "not_initialized"},
+      %{error: error, reason: "not_initialized", request_id: decoded["id"]},
       level: :warning
     )
 
-    {:reply, {:ok, encode_reply(Error.build_json_rpc(error, decoded["id"]))}, state}
+    # Notifications/responses have no id — return nil so the transport replies 202
+    # with no body. Requests must echo their id back so the client can correlate.
+    case decoded["id"] do
+      nil ->
+        {:reply, {:ok, nil}, state}
+
+      request_id ->
+        {:reply, {:ok, encode_reply(Error.build_json_rpc(error, request_id))}, state}
+    end
   end
 
   defp handle_invalid_request(state) do
